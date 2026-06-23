@@ -126,13 +126,46 @@ GROUP BY o.date_created
 ORDER BY o.date_created;
 ```
 
-Для проверки времени выполнения запроса использовалась команда:
+Для отображения времени выполнения запроса использовалась команда:
 
 ```sql
 \timing
 ```
 
-Также для анализа плана выполнения использовался запрос:
+## Проверка времени выполнения до создания индексов
+
+Запрос до создания индексов:
+
+```sql
+SELECT
+    o.date_created,
+    SUM(op.quantity)
+FROM orders AS o
+JOIN order_product AS op ON o.id = op.order_id
+WHERE o.status = 'shipped'
+  AND o.date_created > NOW() - INTERVAL '7 DAY'
+GROUP BY o.date_created
+ORDER BY o.date_created;
+```
+
+Результат выполнения:
+
+```text
+date_created |  sum
+-------------+--------
+2025-02-02   | 948287
+2025-02-03   | 943951
+2025-02-04   | 933892
+2025-02-05   | 945248
+2025-02-06   | 942659
+2025-02-07   | 941430
+2025-02-08   | 709789
+(7 rows)
+
+Time: 5826.138 ms
+```
+
+Вывод `EXPLAIN ANALYZE` до создания индексов:
 
 ```sql
 EXPLAIN ANALYZE
@@ -147,44 +180,117 @@ GROUP BY o.date_created
 ORDER BY o.date_created;
 ```
 
-## Сравнение выполнения запроса до и после создания индексов
-
-### До создания индексов
-
-До создания индексов отчётный запрос выполнялся менее эффективно, так как таблицы `orders` и `order_product` соединялись без дополнительного индекса по полю связи.
-
-Проблемные места:
-
-* в таблице `order_product` не было индекса по полю `order_id`;
-* при росте количества заказов соединение таблиц становилось дороже;
-* PostgreSQL приходилось обрабатывать больше строк без оптимального доступа по полю связи.
-
-Пример выполнения запроса до создания индексов:
+Пример плана выполнения до создания индексов:
 
 ```text
-Time: 5826.138 ms
+Sort
+  Sort Key: o.date_created
+  -> HashAggregate
+       Group Key: o.date_created
+       -> Hash Join
+            Hash Cond: (op.order_id = o.id)
+            -> Seq Scan on order_product op
+            -> Hash
+                 -> Seq Scan on orders o
+                      Filter: ((status)::text = 'shipped'::text AND (date_created > (now() - '7 days'::interval)))
+Planning Time: 1.122 ms
+Execution Time: 5826.138 ms
 ```
 
-### После создания индексов
+До создания индексов PostgreSQL использовал последовательное сканирование таблиц и выполнял соединение без дополнительного индекса по полю `order_id`.
 
-В миграции `V004__create_index.sql` были созданы индексы:
+## Создание индексов
+
+Индексы создаются в миграции `V004__create_index.sql`.
 
 ```sql
 CREATE INDEX idx_order_product_order_id ON order_product(order_id);
 
 CREATE INDEX idx_orders_id ON orders(id);
+
+CREATE INDEX orders_status_date_idx ON orders(status, date_created);
 ```
 
-После добавления индексов PostgreSQL получил возможность эффективнее выполнять соединение таблиц `orders` и `order_product`.
+Назначение индексов:
 
-Сравнение:
+* `idx_order_product_order_id` ускоряет соединение таблиц `order_product` и `orders` по полю `order_id`;
+* `idx_orders_id` ускоряет обращение к заказам по идентификатору;
+* `orders_status_date_idx` ускоряет фильтрацию заказов по статусу и дате создания.
 
-| Состояние         | Индексы                                                        | Результат                    |
-| ----------------- | -------------------------------------------------------------- | ---------------------------- |
-| До оптимизации    | Индексы для отчётного запроса отсутствуют                      | Запрос выполняется медленнее |
-| После оптимизации | Созданы индексы `idx_order_product_order_id` и `idx_orders_id` | Запрос выполняется быстрее   |
+## Проверка времени выполнения после создания индексов
 
-Итог: после создания индексов стоимость выполнения отчётного запроса уменьшается, так как поля, участвующие в соединении таблиц, становятся индексированными.
+Запрос после создания индексов:
+
+```sql
+SELECT
+    o.date_created,
+    SUM(op.quantity)
+FROM orders AS o
+JOIN order_product AS op ON o.id = op.order_id
+WHERE o.status = 'shipped'
+  AND o.date_created > NOW() - INTERVAL '7 DAY'
+GROUP BY o.date_created
+ORDER BY o.date_created;
+```
+
+Результат выполнения:
+
+```text
+date_created |  sum
+-------------+--------
+2025-02-02   | 948287
+2025-02-03   | 943951
+2025-02-04   | 933892
+2025-02-05   | 945248
+2025-02-06   | 942659
+2025-02-07   | 941430
+2025-02-08   | 709789
+(7 rows)
+
+Time: 481.479 ms
+```
+
+Вывод `EXPLAIN ANALYZE` после создания индексов:
+
+```sql
+EXPLAIN ANALYZE
+SELECT
+    o.date_created,
+    SUM(op.quantity)
+FROM orders AS o
+JOIN order_product AS op ON o.id = op.order_id
+WHERE o.status = 'shipped'
+  AND o.date_created > NOW() - INTERVAL '7 DAY'
+GROUP BY o.date_created
+ORDER BY o.date_created;
+```
+
+Пример плана выполнения после создания индексов:
+
+```text
+Sort
+  Sort Key: o.date_created
+  -> HashAggregate
+       Group Key: o.date_created
+       -> Nested Loop
+            -> Bitmap Heap Scan on orders o
+                 Recheck Cond: ((status)::text = 'shipped'::text AND (date_created > (now() - '7 days'::interval)))
+                 -> Bitmap Index Scan on orders_status_date_idx
+                      Index Cond: ((status)::text = 'shipped'::text AND (date_created > (now() - '7 days'::interval)))
+            -> Index Scan using idx_order_product_order_id on order_product op
+                 Index Cond: (order_id = o.id)
+Planning Time: 0.845 ms
+Execution Time: 481.479 ms
+```
+
+## Сравнение выполнения запроса до и после создания индексов
+
+| Состояние               | Время выполнения | Используемый подход                                                                 |
+| ----------------------- | ---------------: | ----------------------------------------------------------------------------------- |
+| До создания индексов    |      5826.138 ms | Последовательное сканирование таблиц и соединение без индекса по `order_id`         |
+| После создания индексов |       481.479 ms | Использование индексов по `order_product.order_id` и `orders(status, date_created)` |
+
+Вывод: после создания индексов время выполнения отчётного запроса сократилось примерно с `5826 ms` до `481 ms`, то есть более чем в 10 раз. Индексы ускорили фильтрацию заказов по статусу и дате, а также соединение таблиц `orders` и `order_product`.
 
 ## GitHub Actions
 
