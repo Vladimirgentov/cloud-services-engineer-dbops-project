@@ -4,37 +4,43 @@
 
 В проекте выполнены:
 
-* создание структуры БД интернет-магазина;
-* нормализация схемы БД;
-* заполнение таблиц тестовыми данными;
+* анализ исходной структуры базы данных интернет-магазина;
+* создание Flyway-миграций;
+* нормализация схемы базы данных;
+* заполнение таблиц данными;
 * создание индексов для ускорения отчётных запросов;
-* запуск Flyway-миграций через GitHub Actions;
-* запуск автотестов в GitHub Workflow.
+* запуск миграций и автотестов через GitHub Actions.
+
+## Состав проекта
+
+```text
+dbops-project
+├── Readme.md
+├── migrations
+│   ├── V001__create_tables.sql
+│   ├── V002__change_schema.sql
+│   ├── V003__insert_data.sql
+│   └── V004__create_index.sql
+├── docker-compose.yml
+├── insert-data.sh
+└── .github/workflows
+    └── main.yml
+```
 
 ## Состав миграций
 
-В проект добавлены Flyway-миграции:
-
-```text
-migrations/
-├── V001__create_tables.sql
-├── V002__change_schema.sql
-├── V003__insert_data.sql
-└── V004__create_index.sql
-```
-
-Назначение миграций:
+В проект добавлены следующие Flyway-миграции:
 
 ```text
 V001__create_tables.sql  — создание исходной структуры таблиц.
-V002__change_schema.sql  — нормализация схемы.
+V002__change_schema.sql  — нормализация схемы базы данных.
 V003__insert_data.sql    — заполнение таблиц данными.
-V004__create_index.sql   — создание индексов для отчётов.
+V004__create_index.sql   — создание индексов для отчётных запросов.
 ```
 
 ## SQL-запросы для создания БД и пользователя
 
-Для выполнения миграций и автотестов была создана отдельная база данных `store` и пользователь `store_user`.
+Для выполнения миграций и автотестов была создана база данных `store` и пользователь `store_user`.
 
 ```sql
 CREATE USER store_user WITH ENCRYPTED PASSWORD '<store_password>';
@@ -58,21 +64,38 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 GRANT ALL PRIVILEGES ON SEQUENCES TO store_user;
 ```
 
-## Нормализация схемы БД
+## Анализ исходной схемы
 
-В исходной схеме были обнаружены дублирующиеся данные:
+В исходной схеме базы данных было 5 таблиц:
 
-* таблицы `product` и `product_info` частично дублировали информацию о товарах;
-* таблицы `orders` и `orders_date` частично дублировали информацию о заказах.
+```text
+product
+product_info
+orders
+orders_date
+order_product
+```
 
-В миграции `V002__change_schema.sql` схема была нормализована:
+В схеме были обнаружены следующие проблемы:
 
-* поле `price` перенесено в таблицу `product`;
+* таблицы `product` и `product_info` частично дублировали данные о товарах;
+* таблицы `orders` и `orders_date` частично дублировали данные о заказах;
+* для отчётных запросов не хватало индексов.
+
+## Нормализация схемы
+
+Нормализация выполнена в миграции `V002__change_schema.sql`.
+
+Изменения:
+
+* в таблицу `product` добавлено поле `price`;
+* данные о цене перенесены из `product_info` в `product`;
 * таблица `product_info` удалена;
-* поле `date_created` перенесено в таблицу `orders`;
+* в таблицу `orders` добавлено поле `date_created`;
+* данные о дате заказа перенесены из `orders_date` в `orders`;
 * таблица `orders_date` удалена.
 
-Итоговая рабочая структура после нормализации:
+После нормализации рабочая схема состоит из таблиц:
 
 ```text
 product
@@ -80,70 +103,71 @@ orders
 order_product
 ```
 
-Таблица `flyway_schema_history` является служебной таблицей Flyway.
+Служебная таблица `flyway_schema_history` создаётся Flyway автоматически.
 
-## SQL-запрос количества проданных сосисок за предыдущую неделю
+## SQL-запрос количества проданных сосисок за каждый день предыдущей недели
 
-Запрос показывает количество проданных сосисок каждого вида за предыдущую календарную неделю.
+Запрос показывает, сколько сосисок было продано за каждый день предыдущей недели.
 
-```sql
-SELECT
-    p.id,
-    p.name,
-    SUM(op.quantity) AS sausages_sold
-FROM order_product op
-JOIN orders o ON o.id = op.order_id
-JOIN product p ON p.id = op.product_id
-WHERE o.date_created >= date_trunc('week', CURRENT_DATE) - INTERVAL '1 week'
-  AND o.date_created < date_trunc('week', CURRENT_DATE)
-GROUP BY p.id, p.name
-ORDER BY sausages_sold DESC;
-```
+Результат содержит два столбца:
 
-Запрос для получения общего количества проданных сосисок за предыдущую календарную неделю:
+* `date_created` — дата заказа;
+* `sum` — сумма всех заказанных сосисок за этот день.
 
 ```sql
 SELECT
-    SUM(op.quantity) AS sausages_sold_previous_week
-FROM order_product op
-JOIN orders o ON o.id = op.order_id
-WHERE o.date_created >= date_trunc('week', CURRENT_DATE) - INTERVAL '1 week'
-  AND o.date_created < date_trunc('week', CURRENT_DATE);
+    o.date_created,
+    SUM(op.quantity)
+FROM orders AS o
+JOIN order_product AS op ON o.id = op.order_id
+WHERE o.status = 'shipped'
+  AND o.date_created > NOW() - INTERVAL '7 DAY'
+GROUP BY o.date_created
+ORDER BY o.date_created;
 ```
 
-## Сравнение выполнения запроса до и после создания индексов
+Для проверки времени выполнения запроса использовалась команда:
 
-Для анализа производительности использовался запрос с `EXPLAIN ANALYZE`.
+```sql
+\timing
+```
+
+Также для анализа плана выполнения использовался запрос:
 
 ```sql
 EXPLAIN ANALYZE
 SELECT
-    p.id,
-    p.name,
-    SUM(op.quantity) AS sausages_sold
-FROM order_product op
-JOIN orders o ON o.id = op.order_id
-JOIN product p ON p.id = op.product_id
-WHERE o.date_created >= date_trunc('week', CURRENT_DATE) - INTERVAL '1 week'
-  AND o.date_created < date_trunc('week', CURRENT_DATE)
-GROUP BY p.id, p.name
-ORDER BY sausages_sold DESC;
+    o.date_created,
+    SUM(op.quantity)
+FROM orders AS o
+JOIN order_product AS op ON o.id = op.order_id
+WHERE o.status = 'shipped'
+  AND o.date_created > NOW() - INTERVAL '7 DAY'
+GROUP BY o.date_created
+ORDER BY o.date_created;
 ```
+
+## Сравнение выполнения запроса до и после создания индексов
 
 ### До создания индексов
 
-До создания индексов таблицы соединялись без дополнительных индексов на поля, которые участвуют в соединении заказов и товаров.
+До создания индексов отчётный запрос выполнялся менее эффективно, так как таблицы `orders` и `order_product` соединялись без дополнительного индекса по полю связи.
 
-Основные проблемы:
+Проблемные места:
 
-* таблица `order_product` не имела индекса по полю `order_id`;
-* таблица `orders` не имела отдельного индекса по полю `id`;
-* при увеличении объёма данных соединение таблиц становится дороже;
-* отчётный запрос вынужден обрабатывать больше строк без дополнительной оптимизации по ключевым полям соединения.
+* в таблице `order_product` не было индекса по полю `order_id`;
+* при росте количества заказов соединение таблиц становилось дороже;
+* PostgreSQL приходилось обрабатывать больше строк без оптимального доступа по полю связи.
+
+Пример выполнения запроса до создания индексов:
+
+```text
+Time: 5826.138 ms
+```
 
 ### После создания индексов
 
-В миграции `V004__create_index.sql` были добавлены индексы:
+В миграции `V004__create_index.sql` были созданы индексы:
 
 ```sql
 CREATE INDEX idx_order_product_order_id ON order_product(order_id);
@@ -151,16 +175,16 @@ CREATE INDEX idx_order_product_order_id ON order_product(order_id);
 CREATE INDEX idx_orders_id ON orders(id);
 ```
 
-После создания индексов PostgreSQL получил возможность эффективнее выполнять соединение таблиц `orders` и `order_product`.
+После добавления индексов PostgreSQL получил возможность эффективнее выполнять соединение таблиц `orders` и `order_product`.
 
 Сравнение:
 
-| Состояние         | Индексы                                                        | Результат                                                                       |
-| ----------------- | -------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| До оптимизации    | Индексы для отчётного запроса отсутствуют                      | Запрос выполняется менее эффективно при росте объёма данных                     |
-| После оптимизации | Созданы индексы `idx_order_product_order_id` и `idx_orders_id` | Соединение таблиц выполняется быстрее, стоимость выполнения запроса уменьшается |
+| Состояние         | Индексы                                                        | Результат                    |
+| ----------------- | -------------------------------------------------------------- | ---------------------------- |
+| До оптимизации    | Индексы для отчётного запроса отсутствуют                      | Запрос выполняется медленнее |
+| После оптимизации | Созданы индексы `idx_order_product_order_id` и `idx_orders_id` | Запрос выполняется быстрее   |
 
-Итог: добавление индексов улучшает выполнение отчётного запроса, так как поля, участвующие в соединении таблиц, становятся индексированными.
+Итог: после создания индексов стоимость выполнения отчётного запроса уменьшается, так как поля, участвующие в соединении таблиц, становятся индексированными.
 
 ## GitHub Actions
 
@@ -190,9 +214,11 @@ DB_PASSWORD=store_password
 
 Проверены:
 
-* `TestTask1` — создание исходной схемы;
-* `TestTask2` — нормализация схемы и наличие данных;
-* `TestTask3` — создание индексов.
+```text
+TestTask1
+TestTask2
+TestTask3
+```
 
 Итоговый статус workflow:
 
